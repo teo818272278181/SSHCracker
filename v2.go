@@ -34,8 +34,8 @@ const (
 	PASSWORD_FILE_NAME = "Pas.txt"
 
 	// Thiết lập hiệu năng
-	DEFAULT_TIMEOUT_SECONDS = 10 // Timeout cho mỗi lần kết nối SSH (giây)
-	CONCURRENT_PER_WORKER   = 75 // Số kết nối đồng thời trên mỗi lõi CPU.
+	DEFAULT_TIMEOUT_SECONDS = 1 // Timeout cho mỗi lần kết nối SSH (giây)
+	CONCURRENT_PER_WORKER   = 4000 // Số kết nối đồng thời trên mỗi lõi CPU.
 )
 // --------------------
 
